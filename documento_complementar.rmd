@@ -63,8 +63,355 @@ zebrafish_dataset_at_75_epiboly_metadata <- zebrafish_dataset_metadata %>% filte
 
 ```
 
-O conjunto de dados SCP162 (de desenvolvimento do peixe-zebra) foi manualmente baixado do portal Broad Single Cell (https://singlecell.broadinstitute.org/single\_cell/study/).
+O conjunto de dados SCP162 (de desenvolvimento do peixe-zebra) foi manualmente baixado do portal Broad Single Cell (https://singlecell.broadinstitute.org/single\_cell).
 
 O conjunto de dados original contém `r nrow(zebrafish_dataset_metadata)` observações ("células"), das quais foram mantidas as observações referentes ao estágio de 75% de epibolia (valor na coluna "Stage" igual a "08.0-75%"). O conjunto de dados usado para análise, então, conteve  `r nrow(zebrafish_dataset_at_75_epiboly_metadata)` observações. 
 
+## Categorização da expressão gênica
 
+O algoritmo do filtro baseado em correlação rápida (FCBF) foi construído voltado à seleção de variáveis categóricas, empregando correlçação por incerteza simétrica. A incerteza simétrica é derivada do ganho de informação (entropia mútua), que foi originalmente descrita para variáveis categóricas. 
+
+A transposição das métricas de variáveis categóricas para valores numéricos era uma tarefa que transcendia o escopo deste projeto. Por simplicidade, então, adotamos os cômputos clássicos, o que levou à necessidade de categorizar discretizar os valores de expressão gênica, passando de contagens (“counts”) para categorias, como “ligado” e “desligado”. 
+
+Na ausência de uma medida objetiva de categorização, escolhemos artibtrariamente uma métrica de categorização. Qualitativamente, os resultados preliminares com essa medida pareciam preservar informações biológicas importantes. Por restrições técnicas e para simplificar a discussão, escolhemos utilizar uma categorização binária consistente para todo o estudo. 
+
+A discretização escolhida baseia-se no menor e o maior valor de expressão gênica para um determinado gene X no conjunto de dados. Como o procedimento é agnóstico a normallizações anteriores da tabela de expressão gênica, e como é possível que um gene seja expresso em todas as células do conjunto de dados, o menor valor não é necessariamente 0. 
+
+Definimos, então, um limiar de 25% entre o valor mínimo e máximo para definir um gene como "ligado" ou "desligado" em uma célula. Por exemplo, para um gene X cuja a mínima expressão for de 100 contagens, e a máxima expressão for de 500 contagens, para todas as células com expressão entre 100 e 200, o gene X estará ligado. Para aquelas com expressão de 200 até 500, o gene X será considerado off. Segue aqui a implementação da função no [pacote FCBF](https://github.com/lubianat/FCBF/blob/master/R/discretization_methods.R). 
+
+```
+.split_vector_in_two_by_min_max_thresh <-
+  function(gene_expression_across_samples,
+           cutoff) {
+    gene_expression_across_samples <-
+      as.numeric(gene_expression_across_samples)
+    max_expression = max(gene_expression_across_samples)
+    min_expression = min(gene_expression_across_samples)
+    break_size = (max_expression - min_expression) * cutoff
+    return(ifelse(
+      gene_expression_across_samples < (min_expression + break_size),
+      'low',
+      'high'
+    ))
+  }
+
+```
+
+
+Para comparações inicais, implementamos em R outras alternativas:
+
+
+### Binarização pela média ou mediana
+
+Calculamos a média ou a mediana do nível de expressão para cada gene. Células com um nível de expressão maior que a média (ou mediana) foram consideradas "ligadas" para aquele gene, e células com um nível igual ou abaixo da média (ou mediana) foram consideradas "desligadas". 
+Implementação em R: 
+
+```
+.split_vector_in_two_by_mean <-
+  function(gene_expression_across_samples) {
+    gene_expression_across_samples <-
+      as.numeric(gene_expression_across_samples)
+    return(ifelse(
+      gene_expression_across_samples < mean(gene_expression_across_samples),
+      'low',
+      'high'
+    ))
+  }
+  
+.split_vector_in_two_by_median <-
+  function(gene_expression_across_samples) {
+    gene_expression_across_samples <-
+      as.numeric(gene_expression_across_samples)
+    return(ifelse(
+      gene_expression_across_samples < median(gene_expression_across_samples),
+      'low',
+      'high'
+    ))
+  }
+
+```
+
+### Discretização por k-means
+
+A discretização por k-means for usada para particionar a expressão de cada gene em  \textit{k} grupos, usando a função \textit{k-means} do pacote \textit{stats} em R. O número de centros (\textit{k}) foi escolhido como 2, 3 ou 4. As configurações padrão foram usadas: algoritmo de Hartigan-Wong e 10 iterações.
+Implementação em R:
+
+```
+.split_vector_in_two_by_mean <-
+  function(gene_expression_across_samples) {
+    gene_expression_across_samples <-
+      as.numeric(gene_expression_across_samples)
+    return(ifelse(
+      gene_expression_across_samples < mean(gene_expression_across_samples),
+      'low',
+      'high'
+    ))
+  }
+```
+
+
+### Identificação dos módulos fcoex
+
+### Filtrando genes por correlação com marcadores
+
+Após a etapa de categorização, ranqueamos os genes de acordo com os agrupamentos de células (agrupamentos pré-definidos pela função \textit{FindClusters} do pacote em R \textit{Seurat}).
+
+Os genes foram ranqueados pela  métrica de correlação da incerteza simétrica (SU, do inglês \textit{symmetrical uncertainty} ), uma variação do ganho de informação/informação mútua (\textit{ information gain/mutual information }). A correlação por SU varia entre 0 (pior) e 1 (melhor) e, diferente do ganho de informação, corrige para diferenças de entropia oriundas de um número diferente de classes em cada variável. 
+
+A implementação em R da função aplicada para cada gene (\textit{get\_SU\_for\_vector\_pair}) está disponível abaixo e no pacote \textit{FCBF}: 
+
+```
+get_SU_for_vector_pair <- function(x, y, base = 2) {
+  if (is.character(x)) {
+    x <- as.factor(x)
+  }
+  y <- as.factor(y) 
+  if (!is.factor(x) || !is.factor(y)) {
+    stop(
+      "For calculating the symmetrical uncertainty, the vectors x & y must be factors.
+      Using a continuous(numeric) feature set leads to this error."
+    )
+  }
+  Ht <- get_joint_entropy_for_vectors(x, y, base)
+  Hx <- get_entropy_for_vector(x, base)
+  Hy <- get_entropy_for_vector(y, base)
+  #cat(Ht,' ',Hx,' ',Hy,'\n')
+  
+  # Returns the symmetrical uncertainty value for the vector pair
+  2 * (Hy + Hx - Ht) / (Hx + Hy)
+  
+}
+
+get_entropy_for_vector <- function(x, base = 2) {
+  if (!is.factor(x)) {
+    stop("For calculating the entropy, the vector must be a factor")
+  }
+  t <- table(x)
+  probabily_of_t <- t / sum(t)
+  if (any(t == 0)) {
+    probabily_of_t <- probabily_of_t[-which(t == 0)]
+  }
+  ent <- -1 * sum(probabily_of_t * log(probabily_of_t) / log(base))
+  if (is.na(ent)) {
+    ent <- 0
+  }
+  ent
+}
+
+get_joint_entropy_for_vectors <- function(x, y, base = 2) {
+  if (!is.factor(x) || !is.factor(y)) {
+    stop("For calculating the joint entropy, the vector x & y must be factors")
+  }
+  t <- table(x, y)
+  probabily_of_t <- as.numeric(t / sum(t))
+  if (any(probabily_of_t == 0)) {
+    probabily_of_t <- probabily_of_t[-which(probabily_of_t == 0)]
+  }
+  ent <- -1 * sum(probabily_of_t * log(probabily_of_t) / log(base))
+  if (is.na(ent)) {
+    ent <- 0
+  }
+  ent
+```
+
+
+
+
+Escolhemos, então, os \textit{ n } primeiros genes, sendo o número exato \textit{ n }escolhido para cada análise. No pacote \textit{fcoex},  sugerimos como \textit{ default }  o \textit{ n } igual a 100 genes, anedoticamente observado como suficiente para a análise em diversos casos. As etapas abaixo foram realizadas apenas para os n genes pré-selecionados.
+
+
+### Encontrando sementes dos módulos
+
+Para os \textit{ n } primeiros genes escolhidos na etapa anterior, aplicamos o algoritmo de filtro do FCBF para selecionar aqueles predominantemente correlacionados com os agrupamentos celulare.s 
+
+Genes predominantemente correlacionados tem a correlação por SU com os agrupamentos maior que a correlação por SU com qualquer outro gene. 
+
+Os genes selecionados pelo filtro baseado em correlação rápida (FCBF) são utilizados, sequencialmente, como sementes dos módulos FCBF.
+
+
+O algoritmo foi implementado no pacote \textit{FCBF}, aqui segue uma versão simplificada do código em R:
+ 
+ 
+ ```
+ 
+ fcbf <-
+  function(feature_table,
+           target_vector,
+           n_genes_selected_in_first_step = 100,
+           samples_in_rows = TRUE) {
+
+      feature_table <- data.frame(feature_table)
+      number_of_variables <- ncol(feature_table)
+      
+      su_values_for_features_with_regards_to_class <-
+        apply(feature_table, 2, function(xx, yy) {
+          get_SU_for_vector_pair(xx, yy)
+        }, target_vector)
+      
+      minimum_su <-
+          sort(su_values_for_features_with_regards_to_class,
+               decreasing = TRUE)[n_genes_selected_in_first_step - 1]
+      
+      s_prime <-
+        data.frame(
+        f = (seq_len(number_of_variables))[which(su_values_for_features_with_regards_to_class >= minimum_su)],
+        su = su_values_for_features_with_regards_to_class[which(su_values_for_features_with_regards_to_class >= minimum_su)])
+      
+      
+      s_prime <- s_prime[sort.list(s_prime$su, decreasing = TRUE),]
+      
+      # s_prime is the list of selected features ranked by su_values_for_features_with_regards_to_class
+      
+      s_prime <- s_prime[, 1]
+      
+      if (length(s_prime) == 0) {
+        stop("No prospective features for this minimum_su level. Threshold: ",
+             minimum_su)
+      }
+      
+      first_prime  <- s_prime[1]
+      cnt <- 1
+      while (TRUE) {
+        next_element_in_prime_list <- .get.next.elem(s_prime, first_prime)
+        if (!is.na(next_element_in_prime_list)) {
+          
+        while (TRUE) {
+            
+          prime_to_be_compared <- next_element_in_prime_list
+          
+          su1 = get_SU_for_vector_pair(feature_table[, first_prime], feature_table[, next_element_in_prime_list])
+          su2 = get_SU_for_vector_pair(feature_table[, next_element_in_prime_list], target_vector)
+            
+          if (su1 > su2) {
+              next_element_in_prime_list <- .get.next.elem(s_prime, next_element_in_prime_list)
+              s_prime <-
+                s_prime[-which(s_prime == prime_to_be_compared)]
+            }
+            
+            else {
+              next_element_in_prime_list <- .get.next.elem(s_prime, next_element_in_prime_list)
+            }
+            if (is.na(next_element_in_prime_list)) {
+              break
+            }
+          }
+        }
+        
+        first_prime  <- .get.next.elem(s_prime, first_prime)
+        
+        if (is.na(first_prime)) {
+          break
+        }
+      }
+      
+      if (length(s_prime) > 1) {
+        suvalues <- apply(feature_table[, s_prime], 2, function(xx, yy) {
+          get_SU_for_vector_pair(xx, yy)
+        }, target_vector)
+        
+        data.frame(index = s_prime, SU = suvalues)
+        
+      } else {
+        data.frame(index = s_prime,
+                   SU = get_SU_for_vector_pair(feature_table[, s_prime], target_vector))
+      }
+    }
+    
+  }
+ 
+ .get.next.elem <- function(s, first_prime) {
+  index <- which(s == first_prime)
+  if (index == length(s)) {
+    NA
+  } else {
+    s[index + 1]
+  }
+}
+ 
+```
+
+## Construindo os módulos / comunidades de coexpressão
+
+O algoritmo constrói uma matriz de incerteza simétrica (SU) de todos os \textit{ n } genes contra todos  os \textit{ n } genes : a matriz de adjacência da rede de coexpressão. 
+
+Essa matriz de adjacência completa é então podada pelo pacote \textit{fcoex}. 
+
+As arestas entre os genes Yi e Yj são determinadas como "0" rede se SU (Yi, Yj)  < SU (Yi, L) ou SU (Yi, Yj) < SU (Yj, A), sendo  L o vetor de agrupamento celulares.  Ou seja, são removidas todas as correlações intergênicas menores que a correlação de quaisquer um dos genes com as etiquetas de agrupamento.
+
+Essa é uma heurística sem justificativa específica determinada a priori. Ela é uma exploração teórica de adaptação do FCBF. A escolha do método foi motivado pela ausência de um padrão ouro, levando à nossa opção de implementar um algoritmo a partir de primeiros princípios, possibilitando maior controle e compreensão. 
+
+A implementação em R, disponível no pacote \textit{fcoex} é como a seguir (note, nem todas as funções chamadas estão demonstradas aqui, por simplicidade):
+
+```
+
+get_gene_by_gene_correlation_matrix_in_series <- function(genes_from_su_ranking, 
+                                    expression_table_only_with_genes_with_high_su){
+  
+  gene_by_gene_su_correlation <- data.frame(genes =  genes_from_su_ranking)
+  
+  pb_findclusters <- progress_bar$new(total = length(genes_from_su_ranking),
+                                      format =   "[:bar] :percent eta:
+                                                  :eta")
+  for (gene_i in genes_from_su_ranking) {
+    
+    print(gene_i)
+    pb_findclusters$tick()
+    discrete_vector_of_gene_i <- as.factor(expression_table_only_with_genes_with_high_su[gene_i, ])
+    
+    gene_i_correlates <-
+      FCBF::get_su_for_feature_table_and_vector(feature_table = expression_table_only_with_genes_with_high_su,
+                                                target_vector = as.factor(discrete_vector_of_gene_i))
+
+    # Reordering rows
+    gene_i_correlates <-
+      gene_i_correlates[match(gene_by_gene_su_correlation$genes, gene_i_correlates$gene),]
+    
+    colnames(gene_i_correlates)[1] <- gene_i
+    
+    gene_by_gene_su_correlation[, gene_i] <- gene_i_correlates[, 1]
+    
+  }
+  
+  gene_by_gene_su_correlation <- gene_by_gene_su_correlation[,-1]
+  
+  
+  return(gene_by_gene_su_correlation)
+  
+  
+}
+
+trim_correlation_matrix <- function(genes_from_su_ranking,
+                        gene_by_gene_su_correlation,
+                        su_to_class,
+                        su_to_class_higher_than_minimum_su){
+
+filtered_gene_by_gene_su_correlation <- data.frame(genes =  genes_from_su_ranking)
+
+for (i in colnames(gene_by_gene_su_correlation)) {
+  tf_vector <-
+    gene_by_gene_su_correlation[, i] > su_to_class$SU[seq_along(su_to_class_higher_than_minimum_su$gene)]
+  filtered_gene_by_gene_su_correlation[, i] <- gene_by_gene_su_correlation[, i] * tf_vector
+}
+
+return(filtered_gene_by_gene_su_correlation)
+
+
+```
+
+Os módulos fcoex são obtidos dessa matrix podada, na qual várias correlações foram levadas a 0. Os módulos são compostos simplesmente por cada gene predominantemente correlacionado (selecionado pelo FCBF) com todos os seus vizinhos da rede. 
+
+Notavelmente, dessa forma os módulos são \textit{fuzzy}, significando que cada gene pode estar presente em diversos módulos. 
+
+O número de genes em um módulo, então, nunca  pode ultrapassar o ( \textit{ n }) determinado originalmente. 
+
+
+## Análise de sobre-representação
+
+Para avaliar qualitativamente se os módulos obtidos representavam agrupamentos relacionados a funções biológicas, realizamos uma análise de sobre-representação no conjunto de dados de PBMC humano em relação ao Reactome Pathway. Uma parcela das vias do Reactome foi selecionada em projeto prévio do laboratório, e a seleção foi reutilizada nesse estudo. As visualizações no corpo da dissertação fazem parte do pacote \textit{fcoex}  e foram adaptadas do pacote \textit{CEMiTool}.
+
+
+##  Identificação de módulos via WGCNA e monocle3
+
+ificamos os módulos usando duas outras ferramentas, além do \textit{fcoex} : o pacote para R \textit{monocle3}, em teste beta, e o pacote  para R \textit{CEMiTool}\cite{Russo2018-nr}, um embrulhador facilitador de uso do pacote WGCNA \cite{Langfelder2008-gr}. 
+Para
+Os módulos identificados com as configurações padrão do pacote foram carregados em um objeto \textit{fcoex}  para a análise de reagrupamento.
